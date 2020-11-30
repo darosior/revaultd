@@ -1,3 +1,6 @@
+# Placeholder to avoid namesquating please DON'T USE FOR NOW
+
+
 # revaultd
 
 ## About Revault
