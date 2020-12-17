@@ -1,7 +1,10 @@
 use crate::revaultd::VaultStatus;
 use revault_tx::{
     bitcoin::{Address, OutPoint},
-    transactions::{CancelTransaction, EmergencyTransaction, UnvaultEmergencyTransaction},
+    transactions::{
+        CancelTransaction, EmergencyTransaction, SpendTransaction, UnvaultEmergencyTransaction,
+        UnvaultTransaction,
+    },
 };
 
 use std::sync::mpsc::SyncSender;
@@ -28,6 +31,16 @@ pub enum RpcMessageIn {
                 UnvaultEmergencyTransaction,
             )>,
         >,
+    ),
+    GetOnchainTxs(
+        OutPoint,
+        SyncSender<(
+            Option<UnvaultTransaction>,
+            Option<SpendTransaction>,
+            Option<CancelTransaction>,
+            Option<EmergencyTransaction>,
+            Option<UnvaultEmergencyTransaction>,
+        )>,
     ),
 }
 

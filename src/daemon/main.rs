@@ -6,7 +6,10 @@ mod threadmessages;
 
 use crate::{
     bitcoind::actions::{bitcoind_main_loop, start_bitcoind},
-    database::{actions::setup_db, interface::db_tip},
+    database::{
+        actions::setup_db,
+        interface::{db_tip, db_transactions, db_vault_by_deposit, RevaultTx, TransactionType},
+    },
     jsonrpc::{jsonrpcapi_loop, jsonrpcapi_setup},
     revaultd::{BlockchainTip, RevaultD, VaultStatus},
     threadmessages::*,
@@ -250,6 +253,223 @@ fn daemon_main(mut revaultd: RevaultD) {
                             "Sending 'getrevocationtxs' (None) result to RPC thread: '{}'",
                             e
                         );
+                        process::exit(1);
+                    });
+                }
+            }
+            RpcMessageIn::GetOnchainTxs(outpoint, response_tx) => {
+                log::trace!("Got 'getonchaintxs' request from RPC thread");
+                let revaultd = revaultd.read().unwrap();
+
+                // First, make sure the vault exists and is confirmed.
+                if let Some(vault) = revaultd.vaults.get(&outpoint) {
+                    let db_vault = db_vault_by_deposit(&db_path, &outpoint)
+                        .unwrap_or_else(|e| {
+                            log::error!("Getting vault from db: {}", e);
+                            process::exit(1);
+                        })
+                        .unwrap_or_else(|| {
+                            log::error!("(Insane db) None vault for '{}'", &outpoint);
+                            process::exit(1);
+                        });
+
+                    let onchain_txs = match vault.status {
+                        // No onchain transaction yet
+                        VaultStatus::Unconfirmed
+                        | VaultStatus::Funded
+                        | VaultStatus::Secured
+                        | VaultStatus::Active
+                        | VaultStatus::Unvaulting
+                        | VaultStatus::EmergencyVaulting => (None, None, None, None, None),
+                        // Only the unvault is confirmed at this point
+                        VaultStatus::Unvaulted
+                        | VaultStatus::Canceling
+                        | VaultStatus::Spendable
+                        | VaultStatus::Spending
+                        | VaultStatus::UnvaultEmergencyVaulting => {
+                            let tx =
+                                db_transactions(&db_path, db_vault.id, &[TransactionType::Unvault])
+                                    .unwrap_or_else(|e| {
+                                        log::error!(
+                                            "Getting transactions (unvault) from db: {}",
+                                            e
+                                        );
+                                        process::exit(1);
+                                    })
+                                    .pop()
+                                    .unwrap_or_else(|| {
+                                        log::error!(
+                                            "No Unvault tx in db for vault at {} (status: {})",
+                                            outpoint,
+                                            vault.status
+                                        );
+                                        process::exit(1);
+                                    })
+                                    .tx;
+                            let unvault_tx = assert_tx_type!(
+                                tx,
+                                Unvault,
+                                "db_transactions() was given TransactionType::Unvault"
+                            );
+
+                            (Some(unvault_tx), None, None, None, None)
+                        }
+                        // Both the spend and the unvault are here
+                        VaultStatus::Spent => {
+                            let mut txs = db_transactions(
+                                &db_path,
+                                db_vault.id,
+                                &[TransactionType::Unvault, TransactionType::Spend],
+                            )
+                            .unwrap_or_else(|e| {
+                                log::error!("Getting transactions (unvault, spend) from db: {}", e);
+                                process::exit(1);
+                            });
+                            if txs.len() != 2 {
+                                log::error!(
+                                    "invalid db_transactions() result for Spent vault: {:#?}",
+                                    txs
+                                );
+                                process::exit(1);
+                            }
+
+                            // We can't assume the ordering, so we support both..
+                            match txs.pop().unwrap().tx {
+                                RevaultTx::Unvault(unvault_tx) => {
+                                    let spend_tx = assert_tx_type!(
+                                        txs.pop().unwrap().tx,
+                                        Spend,
+                                        "Unvault and Spend passed to db_transactions"
+                                    );
+                                    (Some(unvault_tx), Some(spend_tx), None, None, None)
+                                }
+                                RevaultTx::Spend(spend_tx) => {
+                                    let unvault_tx = assert_tx_type!(
+                                        txs.pop().unwrap().tx,
+                                        Unvault,
+                                        "Unvault and Spend passed to db_transactions"
+                                    );
+                                    (Some(unvault_tx), Some(spend_tx), None, None, None)
+                                }
+                                _ => unreachable!("Unvault and Spend passed to db_transactions"),
+                            }
+                        }
+                        // Both the unvault and the cancel are here
+                        VaultStatus::Canceled => {
+                            let mut txs = db_transactions(
+                                &db_path,
+                                db_vault.id,
+                                &[TransactionType::Unvault, TransactionType::Cancel],
+                            )
+                            .unwrap_or_else(|e| {
+                                log::error!(
+                                    "Getting transactions (unvault, cancel) from db: {}",
+                                    e
+                                );
+                                process::exit(1);
+                            });
+                            if txs.len() != 2 {
+                                log::error!(
+                                    "invalid db_transactions() result for Canceled vault: {:#?}",
+                                    txs
+                                );
+                                process::exit(1);
+                            }
+
+                            // We can't assume the ordering, so we support both..
+                            match txs.pop().unwrap().tx {
+                                RevaultTx::Unvault(unvault_tx) => {
+                                    let cancel_tx = assert_tx_type!(
+                                        txs.pop().unwrap().tx,
+                                        Cancel,
+                                        "Unvault and Cancel passed to db_transactions"
+                                    );
+                                    (Some(unvault_tx), None, Some(cancel_tx), None, None)
+                                }
+                                RevaultTx::Cancel(cancel_tx) => {
+                                    let unvault_tx = assert_tx_type!(
+                                        txs.pop().unwrap().tx,
+                                        Unvault,
+                                        "Unvault and Cancel passed to db_transactions"
+                                    );
+                                    (Some(unvault_tx), None, Some(cancel_tx), None, None)
+                                }
+                                _ => unreachable!("Unvault and Spend passed to db_transactions"),
+                            }
+                        }
+                        // Only the first Emergency is confirmed
+                        VaultStatus::EmergencyVaulted => {
+                            let tx = db_transactions(
+                                &db_path,
+                                db_vault.id,
+                                &[TransactionType::Emergency],
+                            )
+                            .unwrap_or_else(|e| {
+                                log::error!("Getting transactions (emergency) from db: {}", e);
+                                process::exit(1);
+                            })
+                            .pop()
+                            .unwrap_or_else(|| {
+                                log::error!(
+                                    "No Emergency tx in db for vault at {} (status: {})",
+                                    outpoint,
+                                    vault.status
+                                );
+                                process::exit(1);
+                            })
+                            .tx;
+                            let emer_tx = assert_tx_type!(
+                                tx,
+                                Emergency,
+                                "db_transactions() was given TransactionType::Emergency"
+                            );
+
+                            (None, None, None, Some(emer_tx), None)
+                        }
+                        // Both the unvault and the cancel are here
+                        VaultStatus::UnvaultEmergencyVaulted => {
+                            let mut txs = db_transactions(
+                                &db_path,
+                                db_vault.id,
+                                &[TransactionType::Unvault, TransactionType::UnvaultEmergency],
+                            )
+                            .unwrap_or_else(|e| {
+                                log::error!(
+                                    "Getting transactions (unvault, emergency) from db: {}",
+                                    e
+                                );
+                                process::exit(1);
+                            })
+                            .into_iter();
+
+                            let unvault_tx = txs
+                                .find(|db_tx| matches!(db_tx.tx, RevaultTx::Unvault(_)))
+                                .unwrap_or_else(|| {
+                                    log::error!(
+                                        "Vault in UnvaultEmergencyVaulted state but no Unvault tx in db",
+                                    );
+                                    process::exit(1);
+                                });
+                            let unvault_tx =
+                                assert_tx_type!(unvault_tx.tx, Unvault, "We just found it");
+
+                            let unemer_tx = txs
+                                .find(|db_tx| matches!(db_tx.tx, RevaultTx::UnvaultEmergency(_)))
+                                .unwrap_or_else(|| {
+                                    log::error!(
+                                        "Vault in UnvaultEmergencyVaulted state but no UnvaultEmergency tx in db",
+                                    );
+                                    process::exit(1);
+                                });
+                            let unemer_tx =
+                                assert_tx_type!(unemer_tx.tx, UnvaultEmergency, "We just found it");
+
+                            (Some(unvault_tx), None, None, None, Some(unemer_tx))
+                        }
+                    };
+
+                    response_tx.send(onchain_txs).unwrap_or_else(|e| {
+                        log::error!("Sending 'getonchaintxs' result to RPC thread: {}", e);
                         process::exit(1);
                     });
                 }

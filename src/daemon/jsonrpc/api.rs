@@ -74,6 +74,36 @@ pub trait RpcApi {
         meta: Self::Metadata,
         txid: String,
     ) -> jsonrpc_core::Result<serde_json::Value>;
+
+    /// Retrieve the onchain transactions of a vault with the given deposit outpoint
+    #[rpc(meta, name = "getonchaintxs")]
+    fn getonchaintxs(
+        &self,
+        meta: Self::Metadata,
+        outpoint: String,
+    ) -> jsonrpc_core::Result<serde_json::Value>;
+}
+
+// Some parsing boilerplate
+
+macro_rules! parse_outpoint {
+    ($outpoint:expr) => {
+        OutPoint::from_str(&$outpoint).map_err(|e| {
+            JsonRpcError::invalid_params(format!(
+                "'{}' is not a valid outpoint ({})",
+                &$outpoint,
+                e.to_string()
+            ))
+        })
+    };
+}
+
+macro_rules! parse_vault_status {
+    ($status:expr) => {
+        VaultStatus::from_str(&$status).map_err(|_| {
+            JsonRpcError::invalid_params(format!("'{}' is not a valid vault status", &$status))
+        })
+    };
 }
 
 pub struct RpcImpl;
@@ -120,14 +150,7 @@ impl RpcApi for RpcImpl {
                 Some(
                     statuses
                         .into_iter()
-                        .map(|status_str| {
-                            VaultStatus::from_str(&status_str).map_err(|_| {
-                                JsonRpcError::invalid_params(format!(
-                                    "'{}' is not a valid vault status",
-                                    &status_str
-                                ))
-                            })
-                        })
+                        .map(|status_str| parse_vault_status!(status_str))
                         .collect::<jsonrpc_core::Result<Vec<VaultStatus>>>()?,
                 )
             } else {
@@ -143,15 +166,7 @@ impl RpcApi for RpcImpl {
                 Some(
                     outpoints
                         .into_iter()
-                        .map(|op_str| {
-                            OutPoint::from_str(&op_str).map_err(|e| {
-                                JsonRpcError::invalid_params(format!(
-                                    "'{}' is not a valid outpoint ({})",
-                                    &op_str,
-                                    e.to_string()
-                                ))
-                            })
-                        })
+                        .map(|op_str| parse_outpoint!(op_str))
                         .collect::<jsonrpc_core::Result<Vec<OutPoint>>>()?,
                 )
             } else {
@@ -208,14 +223,7 @@ impl RpcApi for RpcImpl {
         meta: Self::Metadata,
         outpoint: String,
     ) -> jsonrpc_core::Result<serde_json::Value> {
-        let outpoint = OutPoint::from_str(&outpoint).map_err(|e| {
-            JsonRpcError::invalid_params(format!(
-                "'{}' is not a valid outpoint ({})",
-                &outpoint,
-                e.to_string()
-            ))
-        })?;
-
+        let outpoint = parse_outpoint!(outpoint)?;
         let (response_tx, response_rx) = mpsc::sync_channel(0);
         meta.tx
             .send(RpcMessageIn::GetRevocationTxs(outpoint, response_tx))
@@ -241,5 +249,62 @@ impl RpcApi for RpcImpl {
             "emergency_tx": emer_tx.as_psbt_string().expect("We just derived it"),
             "emergency_unvault_tx": unemer_tx.as_psbt_string().expect("We just derived it"),
         }))
+    }
+
+    fn getonchaintxs(
+        &self,
+        meta: Self::Metadata,
+        outpoint: String,
+    ) -> jsonrpc_core::Result<serde_json::Value> {
+        let outpoint = parse_outpoint!(outpoint)?;
+        let (response_tx, response_rx) = mpsc::sync_channel(0);
+        meta.tx
+            .send(RpcMessageIn::GetOnchainTxs(outpoint, response_tx))
+            .unwrap_or_else(|e| {
+                log::error!("Sending 'getonchaintxs' to main thread: {:?}", e);
+                process::exit(1);
+            });
+        let (unvault_tx, spend_tx, cancel_tx, emergency_tx, emergency_unvault_tx) =
+            response_rx.recv().unwrap_or_else(|e| {
+                log::error!("Receiving 'getrevocationtxs' from main thread: {:?}", e);
+                process::exit(1);
+            });
+
+        let mut res = serde_json::Map::with_capacity(5);
+        if let Some(unvault_tx) = unvault_tx {
+            res.insert(
+                "unvault_tx".to_string(),
+                unvault_tx.as_psbt_string().expect("From db").into(),
+            );
+        }
+        if let Some(spend_tx) = spend_tx {
+            res.insert(
+                "spend_tx".to_string(),
+                spend_tx.as_psbt_string().expect("From db").into(),
+            );
+        }
+        if let Some(cancel_tx) = cancel_tx {
+            res.insert(
+                "cancel_tx".to_string(),
+                cancel_tx.as_psbt_string().expect("From db").into(),
+            );
+        }
+        if let Some(emergency_tx) = emergency_tx {
+            res.insert(
+                "emergency_tx".to_string(),
+                emergency_tx.as_psbt_string().expect("From db").into(),
+            );
+        }
+        if let Some(emergency_unvault_tx) = emergency_unvault_tx {
+            res.insert(
+                "emergency_unvault_tx".to_string(),
+                emergency_unvault_tx
+                    .as_psbt_string()
+                    .expect("From db")
+                    .into(),
+            );
+        }
+
+        Ok(res.into())
     }
 }

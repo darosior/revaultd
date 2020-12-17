@@ -120,12 +120,15 @@ vault with the given deposit `outpoint`.
 
 #### Response
 
-| Field         | Type                                                      | Description                                                           |
-| ------------- | --------------------------------------------------------- | --------------------------------------------------------------------- |
-| `cancel_tx`   | [Vault transaction resource](#vault-transaction-resource) | Cancel transaction -- present if the vault is cancelling or cancelled |
-| `deposit_tx`  | [Vault transaction resource](#vault-transaction-resource) | Deposit transaction                                                   |
-| `spend_tx`    | [Vault transaction resource](#vault-transaction-resource) | Spend transaction -- present if vault is spending or spent            |
-| `unvault_tx`  | [Vault transaction resource](#vault-transaction-resource) | Unvault transaction -- present if vault is unvaulting or unvaulted    |
+| Field                  | Type                                                      | Description                                                                                      |
+| ---------------------  | --------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `cancel_tx`            | [Vault transaction resource](#vault-transaction-resource) | Cancel transaction -- present if the vault is cancelling or cancelled                            |
+| `deposit_tx`           | [Vault transaction resource](#vault-transaction-resource) | Deposit transaction                                                                              |
+| `spend_tx`             | [Vault transaction resource](#vault-transaction-resource) | Spend transaction -- present if vault is spending or spent                                       |
+| `unvault_tx`           | [Vault transaction resource](#vault-transaction-resource) | Unvault transaction -- present if vault is unvaulting or unvaulted                               |
+| `emergency_tx`         | [Vault transaction resource](#vault-transaction-resource) | Emergency transaction -- present if the vault was deep-vaulted by the first emergency tx         |
+| `unvault_emergency_tx` | [Vault transaction resource](#vault-transaction-resource) | Emergency transaction -- present if the vault was deep-vaulted by the unvault emergency tx       |
+
 
 ### `getrevocationtxs`
 
