@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, path::PathBuf, vec::Vec};
 
+use revault_net::sodiumoxide;
 use revault_tx::bitcoin::{util::bip32, Address, Network, PublicKey};
 
 use serde::Deserialize;
@@ -21,11 +22,13 @@ pub struct WatchtowerConfig {
     pub noise_key: String,
 }
 
-/// If we are a stakeholder, we need to connect to our watchtower(s)
+/// If we are a stakeholder, we need to connect to our watchtower(s) and we need
+/// the other stakeholders' public keys we encrypt the Emergency signatures to
 #[derive(Debug, Clone, Deserialize)]
 pub struct StakeholderConfig {
     pub xpub: bip32::ExtendedPubKey,
     pub watchtowers: Vec<WatchtowerConfig>,
+    pub sig_encryption_keys: Vec<sodiumoxide::crypto::box_::PublicKey>,
 }
 
 // Same fields as the WatchtowerConfig struct for now, but leave them separate.
@@ -162,6 +165,14 @@ impl Config {
                 return Err(ConfigError(format!(
                     r#"Our "stakeholder_config" xpub is not part of the given stakeholders' xpubs: {}"#,
                     stk_config.xpub
+                )));
+            }
+
+            if config.stakeholders_xpubs.len() != stk_config.sig_encryption_keys.len() {
+                return Err(ConfigError(format!(
+                    r#"We don't have as much encryption keys ({}) as stakeholders xpubs ({})"#,
+                    stk_config.sig_encryption_keys.len(),
+                    config.stakeholders_xpubs.len()
                 )));
             }
         }

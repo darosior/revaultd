@@ -13,6 +13,7 @@ use crate::{
     revaultd::RevaultD,
 };
 use common::{assume_ok, config::Config};
+use revault_net::sodiumoxide;
 use revault_tx::bitcoin::hashes::hex::ToHex;
 
 use std::{
@@ -131,6 +132,13 @@ fn setup_logger(
 fn main() {
     let args = env::args().collect();
     let conf_file = parse_args(args);
+
+    // We use libsodium for Noise keys, Noise channels (through revault_net), and for
+    // encrypting the Emergency transactions signatures
+    sodiumoxide::init().unwrap_or_else(|_| {
+        eprintln!("Error init'ing libsodium");
+        process::exit(1);
+    });
 
     let config = Config::from_file(conf_file).unwrap_or_else(|e| {
         eprintln!("Error parsing config: {}", e);

@@ -20,8 +20,13 @@ use crate::{
 };
 use common::{assume_ok, assume_some};
 
+use revault_net::{
+    message::server::{GetSigs, RevaultSignature, Sig, Sigs},
+    sodiumoxide,
+    transport::KKTransport,
+};
 use revault_tx::{
-    bitcoin::{Network, OutPoint, Txid},
+    bitcoin::{secp256k1::Signature, Network, OutPoint, Txid, PublicKey as BitcoinPubKey},
     transactions::{
         transaction_chain, CancelTransaction, EmergencyTransaction, RevaultTransaction,
         UnvaultEmergencyTransaction, UnvaultTransaction,
@@ -31,6 +36,7 @@ use revault_tx::{
 };
 
 use std::{
+    collections::BTreeMap,
     fmt,
     path::PathBuf,
     process,
@@ -38,6 +44,7 @@ use std::{
         mpsc::{self, Receiver, RecvError, SendError, Sender},
         Arc, RwLock,
     },
+    thread,
     thread::JoinHandle,
 };
 
@@ -317,6 +324,177 @@ fn txlist_from_outpoints(
     Ok(tx_list)
 }
 
+// Encrypt an Emergency transaction signature to a stakeholder's public key. This is a
+// hack to mitigate a possible DOS with Emergency signatures transiting in clear. See
+// practical-revault for details.
+// FIXME: eventually use precomputed() from libsodium to avoid unnecessary work. Or get
+// rid of this dirty workaround altogether.
+fn encrypt_emergency_sig(
+    sig: &[u8],
+    pk: &sodiumoxide::crypto::box_::PublicKey,
+    sk: &sodiumoxide::crypto::box_::SecretKey,
+) -> Vec<u8> {
+    // Init is called at startup, it's fine.
+    let nonce = sodiumoxide::crypto::box_::gen_nonce();
+    sodiumoxide::crypto::box_::seal(sig, &nonce, pk, sk)
+}
+
+// Decrypt a signature encrypted with `encrypt_emergency_sig`.
+fn decrypt_emergency_sig(
+    sig: &[u8],
+    pk: &sodiumoxide::crypto::box_::PublicKey,
+    sk: &sodiumoxide::crypto::box_::SecretKey,
+) -> Vec<u8> {
+    // Init is called at startup, it's fine.
+    let nonce = sodiumoxide::crypto::box_::gen_nonce();
+    sodiumoxide::crypto::box_::open(sig, &nonce, pk, sk)
+}
+
+// Dump all the signatures from these PSBTs to the sync server.
+fn share_signatures(
+    revaultd: Arc<RwLock<RevaultD>>,
+    cancel_tx: CancelTransaction,
+    emer_tx: EmergencyTransaction,
+    unvault_emer_tx: UnvaultEmergencyTransaction,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let revaultd = revaultd.read().unwrap();
+    let mut transport = KKTransport::connect(
+        revaultd.coordinator_host,
+        &revaultd.noise_secret,
+        &revaultd.coordinator_noisekey,
+    )?;
+    let cancel_sigs = cancel_tx
+        .inner_tx()
+        .inputs
+        .get(0)
+        .expect("Cancel tx has a single input, inbefore fee bumping.")
+        .partial_sigs
+        .clone();
+    let emer_sigs = emer_tx
+        .inner_tx()
+        .inputs
+        .get(0)
+        .expect("Emergency tx has a single input, inbefore fee bumping.")
+        .partial_sigs
+        .clone();
+    let unvault_emer_sigs = unvault_emer_tx
+        .inner_tx()
+        .inputs
+        .get(0)
+        .expect("UnvaultEmergency tx has a single input, inbefore fee bumping.")
+        .partial_sigs
+        .clone();
+
+    // Note that we are looping, but most (if not all) will only have a single signature
+    // attached. We are called by the `revocationtxs` RPC, sent after a `getrevocationtxs`
+    // which generates fresh unsigned transaction.
+
+    // FIXME: use pop_last() once it's stable
+    for (pubkey, sig) in cancel_sigs.into_iter() {
+        let pubkey = pubkey.key;
+        let signature = RevaultSignature::PlaintextSig(Signature::from_der(&sig)?);
+        // TODO: check signature validity before sharing
+        let id = cancel_tx.inner_tx().global.unsigned_tx.txid();
+        let sig_msg = Sig {
+            pubkey,
+            signature,
+            id,
+        };
+        // FIXME: here or upstream, we should retry until timeout
+        transport.write(&serde_json::to_vec(&sig_msg)?)?;
+    }
+
+    // FIXME: use pop_last() once it's stable
+    for (pubkey, sig) in emer_sigs.into_iter() {
+        let pubkey = pubkey.key;
+        let id = emer_tx.inner_tx().global.unsigned_tx.txid();
+        for encryption_key in revaultd.sig_encryption_pubkeys.iter() {
+            let encrypted_signature =
+                encrypt_emergency_sig(&sig, &encryption_key, &revaultd.sig_encryption_secret);
+            let signature = RevaultSignature::EncryptedSig {
+                encryption_key: encryption_key.clone(),
+                encrypted_signature,
+            };
+            let sig_msg = Sig {
+                pubkey,
+                signature,
+                id,
+            };
+            // FIXME: here or upstream, we should retry until timeout
+            transport.write(&serde_json::to_vec(&sig_msg)?)?;
+        }
+    }
+
+    // FIXME: use pop_last() once it's stable
+    for (pubkey, sig) in unvault_emer_sigs.into_iter() {
+        let pubkey = pubkey.key;
+        let id = unvault_emer_tx.inner_tx().global.unsigned_tx.txid();
+        for encryption_key in revaultd.sig_encryption_pubkeys.iter() {
+            let encrypted_signature =
+                encrypt_emergency_sig(&sig, &encryption_key, &revaultd.sig_encryption_secret);
+            let signature = RevaultSignature::EncryptedSig {
+                encryption_key: encryption_key.clone(),
+                encrypted_signature,
+            };
+            let sig_msg = Sig {
+                pubkey,
+                signature,
+                id,
+            };
+            // FIXME: here or upstream, we should retry until timeout
+            transport.write(&serde_json::to_vec(&sig_msg)?)?;
+        }
+    }
+
+    Ok(())
+}
+
+// Will panic if called to fetch an Emergency signature for a Manager (ie no
+// revaultd.sig_encryption_secret)
+fn fetch_signatures(revaultd: Arc<RwLock<RevaultD>>, tx: impl RevaultTransaction) -> Result<impl RevaultTransaction, Box<dyn std::error::Error>> {
+    let revaultd = revaultd.read().unwrap();
+    let mut transport = KKTransport::connect(
+        revaultd.coordinator_host,
+        &revaultd.noise_secret,
+        &revaultd.coordinator_noisekey,
+    )?;
+    let id = tx.inner_tx().global.unsigned_tx.txid();
+    let getsigs_msg = GetSigs { id };
+
+    loop {
+        let got_new_sigs = false;
+
+        let raw_msg = serde_json::to_vec(&getsigs_msg)?;
+        log::trace!("Sending to sync server: '{}'", &String::from_utf8_lossy(&raw_msg));
+        transport.write(&raw_msg)?;
+        let recvd_raw = transport.read()?;
+        log::trace!("Receiving from sync server: '{}'", &String::from_utf8_lossy(&recvd_raw));
+        let Sigs { signatures } = serde_json::from_slice(&recvd_raw)?;
+
+        for (key, sig) in signatures {
+            let pubkey = BitcoinPubKey { compressed: true, key };
+            if !tx.inner_tx().inputs[0].partial_sigs.contains_key(&pubkey) {
+                log::debug!("Adding signature '{}' for pubkey '{}' for tx '{}'", sig, pubkey, id);
+                match sig {
+                    RevaultSignature::PlaintextSig(sig) => tx.add_signature(0, pubkey, sig)?,
+                    RevaultSignature::EncryptedSig{ encryption_key, encrypted_signature } => {
+                        let plaintext_sig = sodiumoxide
+                    }
+                }
+                got_new_sigs = true;
+            }
+        }
+
+        if got_new_sigs && tx.finalize(&revaultd.secp_ctx).is_ok() {
+            log::debug!("Got all signatures for '{}'", id);
+            return Ok(tx);
+        }
+
+        log::debug!("Still waiting for signatures for '{}'", id);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}
+
 /// Handle events incoming from the JSONRPC interface.
 pub fn handle_rpc_messages(
     revaultd: Arc<RwLock<RevaultD>>,
@@ -416,7 +594,21 @@ pub fn handle_rpc_messages(
                 log::trace!("Got 'revocationtxs' from RPC thread");
                 let db_path = &revaultd.read().unwrap().db_file();
 
+                // First, make sure the outpoint they are giving us transactions for actually
+                // exists.
                 let res = if let Some(db_vault) = db_vault_by_deposit(db_path, &outpoint)? {
+                    // Then, start sharing signatures
+                    let revaultd_share = revaultd.clone();
+                    let (c, e, u) = (cancel.clone(), emer.clone(), unvault_emer.clone());
+                    let sharing_thread = thread::spawn(move || {
+                        if let Err(e) = share_signatures(revaultd_share, c, e, u) {
+                            Some(e.to_string())
+                        } else {
+                            None
+                        }
+                    });
+
+                    let 
                     if cancel.finalize(&revaultd.read().unwrap().secp_ctx).is_err() {
                         /* TODO: fetch from the SS */
                     }
@@ -442,6 +634,8 @@ pub fn handle_rpc_messages(
                 } else {
                     Some("Outpoint does not correspond to an existing vault".into())
                 };
+
+                let sharing_res = sharing_thread.join();
 
                 response_tx.send(res)?;
             }
